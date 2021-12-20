@@ -261,16 +261,16 @@ func createS3Client(ctx context.Context, awsConfig awsConfig, option optionalSet
 	return s3.NewFromConfig(cfg), nil
 }
 
-func compressFile(path string) (*os.File, error) {
+func compressFile(path string) (string, error) {
 	isGzip := filepath.Ext(path) == ".gz"
 
-	gz, err := func() (*os.File, error) {
+	gzPath, err := func() (string, error) {
 		file, err := os.Open(path)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to open the file %v: %w", path, err)
+			return "", fmt.Errorf("Failed to open the file %v: %w", path, err)
 		}
 		if isGzip {
-			return file, nil
+			return file.Name(), nil
 		}
 		defer file.Close()
 
@@ -278,30 +278,30 @@ func compressFile(path string) (*os.File, error) {
 		dist, err := os.Create(gzPath)
 		if err != nil {
 			dist.Close()
-			return nil, fmt.Errorf("Failed to create the file %v: %w", gzPath, err)
+			return "", fmt.Errorf("Failed to create the file %v: %w", gzPath, err)
 		}
 		zw, err := gzip.NewWriterLevel(dist, gzip.DefaultCompression)
 		if err != nil {
 			dist.Close()
-			return nil, fmt.Errorf("Failed to create gzip writer %v: %w", gzPath, err)
+			return "", fmt.Errorf("Failed to create gzip writer %v: %w", gzPath, err)
 		}
 		defer zw.Close()
 
 		if _, err = io.Copy(zw, file); err != nil {
 			dist.Close()
-			return nil, fmt.Errorf("Failed to write contents to the gzip file %v: %w", gzPath, err)
+			return "", fmt.Errorf("Failed to write contents to the gzip file %v: %w", gzPath, err)
 		}
-		return dist, nil
+		return dist.Name(), nil
 	}()
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	if !isGzip {
 		if err = os.Remove(path); err != nil {
 			log.Printf("[WARN] Failed to remove the file %v: %v", path, err)
 		}
 	}
-	return gz, nil
+	return gzPath, nil
 }
 
 func uploadTargetFiles(ctx context.Context, c *s3.Client, settings requiredSettings, option optionalSettings) ([]string, error) {
@@ -353,18 +353,16 @@ func uploadTargetFiles(ctx context.Context, c *s3.Client, settings requiredSetti
 			return nil
 		}
 
-		gzip, err := compressFile(path)
+		gzPath, err := compressFile(path)
 		if err != nil {
 			hasError = true
 			log.Printf("[ERROR] Failed to compress the file %v to upload: %v", path, err)
 			return nil
 		}
-		gzPath := gzip.Name()
 		rp, err := filepath.Rel(settings.TargetFilesDirPath, gzPath)
 		if err != nil {
 			hasError = true
 			log.Printf("[ERROR] Failed to get relative path of the file %v to upload: %v", gzPath, err)
-			gzip.Close()
 			return nil
 		}
 
@@ -374,8 +372,15 @@ func uploadTargetFiles(ctx context.Context, c *s3.Client, settings requiredSetti
 		slots <- struct{}{}
 		go func() {
 			defer wg.Done()
+			gzip, err := os.Open(gzPath)
+			if err != nil {
+				emu.Lock()
+				hasError = true
+				emu.Unlock()
+				log.Printf("[ERROR] Failed to upload file %v: %v", gzPath, err)
+			}
 			var r io.Reader = gzip
-			err := uploadFile(ctx, c, settings.S3Bucket, key, r, option)
+			err = uploadFile(ctx, c, settings.S3Bucket, key, r, option)
 			gzip.Close()
 			if err != nil {
 				emu.Lock()
